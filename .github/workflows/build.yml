@@ -60,8 +60,8 @@ jobs:
               applicationId "com.htjulianto.app"
               minSdk 21
               targetSdk 34
-              versionCode 1
-              versionName "1.0"
+              versionCode 2
+              versionName "2.0"
             }
             buildTypes { release { minifyEnabled false } }
             compileOptions {
@@ -72,12 +72,17 @@ jobs:
           dependencies { implementation 'androidx.appcompat:appcompat:1.6.1' }
           ABEOF
 
+          # ── AndroidManifest ──────────────────────────────────────────
           python3 << 'PYEOF'
           manifest = '''<?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
             <uses-permission android:name="android.permission.INTERNET"/>
             <uses-permission android:name="android.permission.RECORD_AUDIO"/>
             <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
+            <uses-permission android:name="android.permission.WAKE_LOCK"/>
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
+            <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
             <application
               android:label="HT Julianto"
               android:icon="@mipmap/ic_launcher"
@@ -85,23 +90,32 @@ jobs:
               <activity
                 android:name=".MainActivity"
                 android:exported="true"
-                android:screenOrientation="portrait">
+                android:screenOrientation="portrait"
+                android:configChanges="orientation|screenSize|keyboardHidden">
                 <intent-filter>
                   <action android:name="android.intent.action.MAIN"/>
                   <category android:name="android.intent.category.LAUNCHER"/>
                 </intent-filter>
               </activity>
+              <service
+                android:name=".RadioService"
+                android:exported="false"
+                android:foregroundServiceType="mediaPlayback"/>
             </application>
           </manifest>'''
           open('app/src/main/AndroidManifest.xml','w').write(manifest)
           PYEOF
 
+          # ── MainActivity.java ─────────────────────────────────────────
           python3 << 'PYEOF'
           java = r'''package com.htjulianto.app;
           import android.app.Activity;
+          import android.content.Intent;
+          import android.os.Build;
           import android.os.Bundle;
           import android.os.Handler;
           import android.os.Looper;
+          import android.os.PowerManager;
           import android.speech.tts.TextToSpeech;
           import android.webkit.JavascriptInterface;
           import android.webkit.PermissionRequest;
@@ -116,6 +130,7 @@ jobs:
             private TextToSpeech tts;
             private boolean ttsReady = false;
             private Handler uiHandler = new Handler(Looper.getMainLooper());
+            private PowerManager.WakeLock wakeLock;
 
             public class TTSBridge {
               @JavascriptInterface
@@ -137,33 +152,49 @@ jobs:
                 });
               }
               @JavascriptInterface
-              public boolean isReady() {
-                return ttsReady;
-              }
+              public boolean isReady() { return ttsReady; }
             }
 
             @Override protected void onCreate(Bundle s) {
               super.onCreate(s);
 
-              // Init TTS
+              // ── WakeLock: CPU tetap aktif walau layar mati ──────────
+              PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+              wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "HTJulianto::RadioLock");
+              wakeLock.acquire();
+
+              // ── ForegroundService: cegah Android bunuh app ──────────
+              Intent svcIntent = new Intent(this, RadioService.class);
+              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(svcIntent);
+              } else {
+                startService(svcIntent);
+              }
+
+              // ── TTS ─────────────────────────────────────────────────
               tts = new TextToSpeech(this, this);
 
+              // ── WebView setup ────────────────────────────────────────
               w = new WebView(this);
               setContentView(w);
+
               WebSettings ws = w.getSettings();
               ws.setJavaScriptEnabled(true);
               ws.setDomStorageEnabled(true);
+              ws.setDatabaseEnabled(true);
               ws.setMediaPlaybackRequiresUserGesture(false);
               ws.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+              ws.setBlockNetworkLoads(false);
+              // Izinkan WebRTC berjalan di background
+              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                ws.setOffscreenPreRaster(true);
+              }
 
-              // Pasang TTS bridge — bisa dipanggil dari JS sebagai Android.speak(teks)
               w.addJavascriptInterface(new TTSBridge(), "Android");
 
               w.setWebViewClient(new WebViewClient() {
                 @Override
                 public void onPageFinished(WebView view, String url) {
-                  // Injeksi JS: override speakAfterDing agar pakai Android TTS native
-                  // Delay 800ms agar page JS sudah selesai load
                   uiHandler.postDelayed(new Runnable() {
                     @Override public void run() {
                       view.evaluateJavascript(
@@ -188,11 +219,24 @@ jobs:
               w.setWebChromeClient(new WebChromeClient() {
                 @Override
                 public void onPermissionRequest(PermissionRequest request) {
+                  // Auto-grant semua izin (mikrofon, kamera, dll)
                   request.grant(request.getResources());
                 }
               });
 
               w.loadUrl("https://alifavif-cmd.github.io/CHENEL-HT/");
+            }
+
+            // ── KUNCI: jangan pause WebView saat layar mati / app minimize ──
+            @Override protected void onPause() {
+              super.onPause();
+              // SENGAJA tidak memanggil w.onPause()
+              // Agar PubNub WebSocket & WebRTC tetap hidup saat layar mati
+            }
+
+            @Override protected void onResume() {
+              super.onResume();
+              if (w != null) w.onResume();
             }
 
             @Override
@@ -210,11 +254,16 @@ jobs:
             }
 
             @Override public void onBackPressed() {
-              if (w.canGoBack()) w.goBack();
+              if (w != null && w.canGoBack()) w.goBack();
               else super.onBackPressed();
             }
 
             @Override protected void onDestroy() {
+              // Bebaskan WakeLock
+              if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+              // Stop service
+              stopService(new Intent(this, RadioService.class));
+              // Bersihkan TTS
               if (tts != null) { tts.stop(); tts.shutdown(); }
               super.onDestroy();
             }
@@ -222,6 +271,79 @@ jobs:
           open('app/src/main/java/com/htjulianto/app/MainActivity.java','w').write(java)
           PYEOF
 
+          # ── RadioService.java ─────────────────────────────────────────
+          python3 << 'PYEOF'
+          svc = r'''package com.htjulianto.app;
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Intent;
+          import android.os.Build;
+          import android.os.IBinder;
+
+          public class RadioService extends Service {
+            private static final String CH_ID  = "ht_radio_ch";
+            private static final int    NF_ID  = 101;
+
+            @Override
+            public void onCreate() {
+              super.onCreate();
+              createChannel();
+
+              // Intent buka MainActivity saat notifikasi diketuk
+              Intent open = new Intent(this, MainActivity.class);
+              open.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
+              PendingIntent pi = PendingIntent.getActivity(
+                this, 0, open,
+                Build.VERSION.SDK_INT >= 23
+                  ? PendingIntent.FLAG_IMMUTABLE
+                  : 0
+              );
+
+              Notification.Builder nb;
+              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                nb = new Notification.Builder(this, CH_ID);
+              } else {
+                nb = new Notification.Builder(this);
+                nb.setPriority(Notification.PRIORITY_LOW);
+              }
+              nb.setContentTitle("HT Julianto")
+                .setContentText("Radio aktif di latar belakang")
+                .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                .setOngoing(true)
+                .setContentIntent(pi);
+
+              startForeground(NF_ID, nb.build());
+            }
+
+            // START_STICKY: service akan dihidupkan ulang otomatis jika dibunuh Android
+            @Override
+            public int onStartCommand(Intent intent, int flags, int startId) {
+              return START_STICKY;
+            }
+
+            @Override
+            public IBinder onBind(Intent intent) { return null; }
+
+            private void createChannel() {
+              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                NotificationChannel ch = new NotificationChannel(
+                  CH_ID,
+                  "HT Radio Aktif",
+                  NotificationManager.IMPORTANCE_LOW
+                );
+                ch.setDescription("Menjaga koneksi radio tetap aktif");
+                ch.setSound(null, null);
+                getSystemService(NotificationManager.class).createNotificationChannel(ch);
+              }
+            }
+          }'''
+          open('app/src/main/java/com/htjulianto/app/RadioService.java','w').write(svc)
+          PYEOF
+
+          # ── strings.xml & styles.xml ──────────────────────────────────
           python3 << 'PYEOF'
           strings = '''<?xml version="1.0" encoding="utf-8"?>
           <resources>

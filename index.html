@@ -782,7 +782,7 @@ function pwrOff(){
     setTimeout(()=>beep(392,.6,.5),480);
     if(typeof aDing==='function')aDing(); // ← suara ding-dong pramugari power OFF
     setTimeout(()=>{
-      safeSpeak('Terima kasih telah menggunakan layanan H T Julianto. Perangkat akan dimatikan. Sampai jumpa.',
+      speakAfterDing('Terima kasih telah menggunakan layanan H T Julianto. Perangkat akan dimatikan. Sampai jumpa.',
         ()=>{setTimeout(()=>{D('offOverlay').classList.add('show');D('pwrBtn').classList.remove('on');},300);});
     },1100);
   },80);
@@ -801,7 +801,7 @@ function pwrOn(){
     setTimeout(()=>beep(523,.6,.5),480);
     if(typeof aDing==='function')aDing(); // ← suara ding-dong pramugari power ON
     setTimeout(()=>{
-      safeSpeak('Selamat datang di H T Julianto. Perangkat komunikasi Anda kini aktif. Silakan pilih channel untuk memulai. Terima kasih.',null);
+      speakAfterDing('Selamat datang di H T Julianto. Perangkat komunikasi Anda kini aktif. Silakan pilih channel untuk memulai. Terima kasih.',null);
     },1100);
   },80);
   if(pnReady)startHB();
@@ -1390,6 +1390,17 @@ function aDing(){
   if(_dingURI){try{const a=new Audio(_dingURI);a.volume=0.7;a.play().catch(()=>{});}catch(e){}}
 }
 window.aDing = aDing;
+
+// === FIX APK: alias playDingDong → aDing (APK injection memanggil window.playDingDong()) ===
+window.playDingDong = aDing;
+
+// === FIX APK: definisikan speakAfterDing agar guard injection APK tidak skip ===
+// Di browser → pakai safeSpeak (ada timeout fallback 2.5s)
+// Di APK    → APK override ini pakai Android.speak() + playDingDong()
+window.speakAfterDing = function(text, doneCb) {
+  dbg('speakAfterDing called, AndroidTTS=' + (window._usingAndroidTTS||false));
+  safeSpeak(text, doneCb);
+};
 
 // Helper tombol admin — reliable di Android WebView (data-* + ontouchend+onclick)
 window.aBtnTouch=function(e){
